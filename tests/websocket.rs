@@ -8,17 +8,15 @@ const ECHO_SERVER_URL: &str = env!("ECHO_SERVER_URL");
 
 #[wasm_bindgen_test]
 async fn websocket_works() {
-    let ws = WebSocket::open(ECHO_SERVER_URL).unwrap();
+    let mut ws = WebSocket::open(ECHO_SERVER_URL).unwrap();
 
-    let (mut sender, mut receiver) = (ws.sender, ws.receiver);
-
-    sender
+    ws
         .send(Message::Text("test".to_string()))
         .await
         .unwrap();
 
     // ignore the first message
-    let _ = receiver.next().await;
+    let _ = ws.next().await;
     assert_eq!(
         receiver.next().await.unwrap().unwrap(),
         Message::Text("test".to_string())

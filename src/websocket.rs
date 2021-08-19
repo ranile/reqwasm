@@ -10,15 +10,29 @@
 //! #    ($($expr:expr),*) => {{}};
 //! # }
 //! # fn no_run() {
-//! let ws = WebSocket::open("wss://echo.websocket.org").unwrap();
+//! let mut  ws = WebSocket::open("wss://echo.websocket.org").unwrap();
 //!
+//! spawn_local({
+//!     let mut  ws = ws.clone();
+//!     async move {
+//!         ws.send(Message::Text(String::from("test"))).await.unwrap();
+//!         ws.send(Message::Text(String::from("test 2"))).await.unwrap();
+//!     }
+//! });
+//!
+//! spawn_local(async move {
+//!     while let Some(msg) = ws.next().await {
+//!         console_log!(format!("1. {:?}", msg))
+//!     }
+//!     console_log!("WebSocket Closed")
+//! })
 //! # }
 //! ```
 use crate::js_to_js_error;
 use async_broadcast::Receiver;
 use futures::ready;
 use futures::{Sink, Stream};
-use pin_project::pin_project;
+use pin_project::{pin_project, pinned_drop};
 use std::cell::RefCell;
 use std::pin::Pin;
 use std::rc::Rc;
@@ -26,10 +40,11 @@ use std::task::{Context, Poll, Waker};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use web_sys::{ErrorEvent, MessageEvent};
+use crate::websocket::errors::WebSocketError;
 
 /// Wrapper around browser's WebSocket API.
 #[allow(missing_debug_implementations)]
-#[pin_project]
+#[pin_project(PinnedDrop)]
 #[derive(Clone)]
 pub struct WebSocket {
     ws: web_sys::WebSocket,
@@ -116,6 +131,22 @@ impl WebSocket {
             message_receiver: receiver,
         })
     }
+
+    /// Closes the websocket.
+    ///
+    /// See the [MDN Documentation](https://developer.mozilla.org/en-US/docs/Web/API/WebSocket/close#parameters)
+    /// to learn about parameters passed to this function and when it can return an `Err(_)`
+    pub fn close(self, code: Option<u16>, reason: Option<&str>) -> Result<(), WebSocketError> {
+        let result = match (code, reason) {
+            (None, None) => self.ws.close(),
+            (Some(code), None) => self.ws.close_with_code(code),
+            (Some(code), Some(reason)) => self.ws.close_with_code_and_reason(code, reason),
+            // default code is 1005 so we use it,
+            // see: https://developer.mozilla.org/en-US/docs/Web/API/WebSocket/close#parameters
+            (None, Some(reason)) => self.ws.close_with_code_and_reason(1005, reason)
+        };
+        result.map_err(|e| WebSocketError::JsError(js_to_js_error(e)))
+    }
 }
 
 #[derive(Clone)]
@@ -188,6 +219,13 @@ impl Stream for WebSocket {
             Some(StreamMessage::ConnectionClose) => Poll::Ready(None),
             None => Poll::Ready(None),
         }
+    }
+}
+
+#[pinned_drop]
+impl PinnedDrop for WebSocket {
+    fn drop(self: Pin<&mut Self>) {
+        self.ws.close().unwrap();
     }
 }
 
