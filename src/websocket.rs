@@ -29,6 +29,7 @@
 //! # }
 //! ```
 use crate::js_to_js_error;
+use crate::websocket::errors::WebSocketError;
 use async_broadcast::Receiver;
 use futures::ready;
 use futures::{Sink, Stream};
@@ -40,7 +41,6 @@ use std::task::{Context, Poll, Waker};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use web_sys::{ErrorEvent, MessageEvent};
-use crate::websocket::errors::WebSocketError;
 
 /// Wrapper around browser's WebSocket API.
 #[allow(missing_debug_implementations)]
@@ -143,7 +143,7 @@ impl WebSocket {
             (Some(code), Some(reason)) => self.ws.close_with_code_and_reason(code, reason),
             // default code is 1005 so we use it,
             // see: https://developer.mozilla.org/en-US/docs/Web/API/WebSocket/close#parameters
-            (None, Some(reason)) => self.ws.close_with_code_and_reason(1005, reason)
+            (None, Some(reason)) => self.ws.close_with_code_and_reason(1005, reason),
         };
         result.map_err(|e| WebSocketError::JsError(js_to_js_error(e)))
     }

@@ -10,15 +10,13 @@ const ECHO_SERVER_URL: &str = env!("ECHO_SERVER_URL");
 async fn websocket_works() {
     let mut ws = WebSocket::open(ECHO_SERVER_URL).unwrap();
 
-    ws
-        .send(Message::Text("test".to_string()))
-        .await
-        .unwrap();
+    ws.send(Message::Text("test".to_string())).await.unwrap();
 
-    // ignore the first message
+    // ignore first message
+    // the echo-server used sends it's info in the first message
     let _ = ws.next().await;
     assert_eq!(
-        receiver.next().await.unwrap().unwrap(),
+        ws.next().await.unwrap().unwrap(),
         Message::Text("test".to_string())
     )
 }
