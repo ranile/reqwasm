@@ -12,44 +12,34 @@
 //! # fn no_run() {
 //! let ws = WebSocket::open("wss://echo.websocket.org").unwrap();
 //!
-//! let (mut sender, mut receiver) = (ws.sender, ws.receiver);
-//!
-//! spawn_local(async move {
-//!     while let Some(m) = receiver.next().await {
-//!         match m {
-//!             Ok(Message::Text(m)) => console_log!("message", m),
-//!             Ok(Message::Bytes(m)) => console_log!("message", format!("{:?}", m)),
-//!             Err(e) => {}
-//!         }
-//!     }
-//! });
-//!
-//! spawn_local(async move {
-//!     sender.send(Message::Text("test".to_string())).await.unwrap();
-//! })
 //! # }
 //! ```
-use crate::{js_to_error, JsError};
-use futures::channel::mpsc;
-use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender};
-use futures::StreamExt;
+use crate::js_to_js_error;
+use async_broadcast::Receiver;
+use futures::ready;
+use futures::{Sink, Stream};
+use pin_project::pin_project;
+use std::cell::RefCell;
+use std::pin::Pin;
+use std::rc::Rc;
+use std::task::{Context, Poll, Waker};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use web_sys::{ErrorEvent, MessageEvent};
 
 /// Wrapper around browser's WebSocket API.
 #[allow(missing_debug_implementations)]
+#[pin_project]
+#[derive(Clone)]
 pub struct WebSocket {
-    /// Raw websocket instance
-    pub websocket: web_sys::WebSocket,
-    /// Channel's receiver component used to receive messages from the WebSocket
-    pub receiver: UnboundedReceiver<Result<Message, WebSocketError>>,
-    /// Channel's sender component used to send messages over the WebSocket
-    pub sender: UnboundedSender<Message>,
+    ws: web_sys::WebSocket,
+    sink_wakers: Rc<RefCell<Vec<Waker>>>,
+    #[pin]
+    message_receiver: Receiver<StreamMessage>,
 }
 
 /// Message sent to and received from WebSocket.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 pub enum Message {
     /// String message
     Text(String),
@@ -59,17 +49,19 @@ pub enum Message {
 
 impl WebSocket {
     /// Establish a WebSocket connection.
-    pub fn open(url: &str) -> Result<Self, crate::error::Error> {
-        let ws = web_sys::WebSocket::new(url).map_err(js_to_error)?;
+    pub fn open(url: &str) -> Result<Self, errors::WebSocketError> {
+        let wakers: Rc<RefCell<Vec<Waker>>> = Rc::new(RefCell::new(vec![]));
+        let ws = web_sys::WebSocket::new(url)
+            .map_err(|e| errors::WebSocketError::JsError(js_to_js_error(e)))?;
 
-        let (internal_sender, receiver) = mpsc::unbounded();
-        let (sender, mut internal_receiver) = mpsc::unbounded();
-
-        let (notify_sender, mut notify_receiver) = mpsc::unbounded();
+        let (sender, receiver) = async_broadcast::broadcast(10);
 
         let open_callback: Closure<dyn FnMut()> = {
+            let wakers = Rc::clone(&wakers);
             Closure::wrap(Box::new(move || {
-                notify_sender.unbounded_send(()).unwrap();
+                for waker in wakers.borrow_mut().drain(..) {
+                    waker.wake();
+                }
             }) as Box<dyn FnMut()>)
         };
 
@@ -77,11 +69,14 @@ impl WebSocket {
         open_callback.forget();
 
         let message_callback: Closure<dyn FnMut(MessageEvent)> = {
-            let sender = internal_sender.clone();
+            let sender = sender.clone();
             Closure::wrap(Box::new(move |e: MessageEvent| {
-                sender
-                    .unbounded_send(Ok(parse_message(e)))
-                    .expect("message send")
+                let sender = sender.clone();
+                wasm_bindgen_futures::spawn_local(async move {
+                    let _ = sender
+                        .broadcast(StreamMessage::Message(parse_message(e)))
+                        .await;
+                })
             }) as Box<dyn FnMut(MessageEvent)>)
         };
 
@@ -89,65 +84,45 @@ impl WebSocket {
         message_callback.forget();
 
         let error_callback: Closure<dyn FnMut(ErrorEvent)> = {
-            let sender = internal_sender.clone();
+            let sender = sender.clone();
             Closure::wrap(Box::new(move |e: ErrorEvent| {
-                sender.unbounded_send(parse_error(e)).expect("message send")
+                let sender = sender.clone();
+                wasm_bindgen_futures::spawn_local(async move {
+                    let _ = sender
+                        .broadcast(StreamMessage::ConnectionError(parse_error(e)))
+                        .await;
+                })
             }) as Box<dyn FnMut(ErrorEvent)>)
         };
 
         ws.set_onerror(Some(error_callback.as_ref().unchecked_ref()));
         error_callback.forget();
 
-        let fut = {
-            let ws = ws.clone();
-            let sender = internal_sender;
-            async move {
-                notify_receiver.next().await;
-                while let Some(message) = internal_receiver.next().await {
-                    let result = match message {
-                        Message::Bytes(bytes) => ws.send_with_u8_array(&bytes),
-                        Message::Text(message) => ws.send_with_str(&message),
-                    };
-
-                    if let Err(e) = result {
-                        match js_to_error(e) {
-                            crate::Error::JsError(error) => sender
-                                .unbounded_send(Err(WebSocketError::JsError(error)))
-                                .unwrap(),
-                            _ => unreachable!(),
-                        }
-                    }
-                }
-            }
+        let close_callback: Closure<dyn FnMut()> = {
+            Closure::wrap(Box::new(move || {
+                let sender = sender.clone();
+                wasm_bindgen_futures::spawn_local(async move {
+                    let _ = sender.broadcast(StreamMessage::ConnectionClose).await;
+                })
+            }) as Box<dyn FnMut()>)
         };
-        wasm_bindgen_futures::spawn_local(fut);
+
+        ws.set_onerror(Some(close_callback.as_ref().unchecked_ref()));
+        close_callback.forget();
 
         Ok(Self {
-            websocket: ws,
-            receiver,
-            sender,
+            ws,
+            sink_wakers: wakers,
+            message_receiver: receiver,
         })
     }
 }
 
-fn parse_error(event: ErrorEvent) -> Result<Message, WebSocketError> {
-    Err(WebSocketError::ConnectionError {
-        message: event.message(),
-    })
-}
-
-/// Error from a WebSocket
-#[derive(Debug, thiserror::Error)]
-pub enum WebSocketError {
-    /// This is created from [`ErrorEvent`] received from `onerror` listener of the WebSocket.
-    #[error("{message}")]
-    ConnectionError {
-        /// The error message.
-        message: String,
-    },
-    /// Error from JavaScript
-    #[error("{0}")]
-    JsError(JsError),
+#[derive(Clone)]
+enum StreamMessage {
+    ConnectionError(errors::ConnectionError),
+    Message(Message),
+    ConnectionClose,
 }
 
 fn parse_message(event: MessageEvent) -> Message {
@@ -158,5 +133,87 @@ fn parse_message(event: MessageEvent) -> Message {
         Message::Text(String::from(&txt))
     } else {
         unreachable!("message event, received Unknown: {:?}", event.data());
+    }
+}
+
+fn parse_error(event: ErrorEvent) -> errors::ConnectionError {
+    errors::ConnectionError {
+        message: event.message(),
+    }
+}
+
+impl Sink<Message> for WebSocket {
+    type Error = errors::WebSocketError;
+
+    fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        let ready_state = self.ws.ready_state();
+        if ready_state == 0 {
+            self.sink_wakers.borrow_mut().push(cx.waker().clone());
+            Poll::Pending
+        } else {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    fn start_send(self: Pin<&mut Self>, item: Message) -> Result<(), Self::Error> {
+        let result = match item {
+            Message::Bytes(bytes) => self.ws.send_with_u8_array(&bytes),
+            Message::Text(message) => self.ws.send_with_str(&message),
+        };
+        match result {
+            Ok(_) => Ok(()),
+            Err(e) => Err(errors::WebSocketError::JsError(js_to_js_error(e))),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl Stream for WebSocket {
+    type Item = Result<Message, errors::WebSocketError>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let msg = ready!(self.project().message_receiver.poll_next(cx));
+        match msg {
+            Some(StreamMessage::Message(msg)) => Poll::Ready(Some(Ok(msg))),
+            Some(StreamMessage::ConnectionError(err)) => {
+                Poll::Ready(Some(Err(errors::WebSocketError::ConnectionError(err))))
+            }
+            Some(StreamMessage::ConnectionClose) => Poll::Ready(None),
+            None => Poll::Ready(None),
+        }
+    }
+}
+
+pub mod errors {
+    //! The errors
+
+    /// This is created from [`ErrorEvent`] received from `onerror` listener of the WebSocket.
+    #[derive(Clone, Debug, thiserror::Error)]
+    #[error("{message}")]
+    pub struct ConnectionError {
+        /// The error message.
+        pub(super) message: String,
+    }
+
+    /// Error returned by `WebSocket`
+    #[derive(Clone, Debug, thiserror::Error)]
+    pub enum WebSocketError {
+        /// Error from `onerror`
+        #[error("{0}")]
+        ConnectionError(
+            #[source]
+            #[from]
+            ConnectionError,
+        ),
+        /// Error while sending message
+        #[error("{0}")]
+        JsError(crate::JsError),
     }
 }

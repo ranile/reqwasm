@@ -23,6 +23,10 @@ anyhow = "1.0"
 thiserror = "1.0"
 futures = "0.3.14"
 
+gloo-console = "0.1.0"
+async-broadcast = "0.3"
+pin-project = "1"
+
 [dependencies.web-sys]
 version = "0.3.4"
 features = [
