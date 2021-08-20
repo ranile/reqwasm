@@ -62,6 +62,23 @@ pub enum Message {
     Bytes(Vec<u8>),
 }
 
+/// The state of the websocket.
+///
+/// See [`WebSocket.readyState` on MDN](https://developer.mozilla.org/en-US/docs/Web/API/WebSocket/readyState)
+/// to learn more.
+#[derive(Copy, Clone, Debug)]
+pub enum State {
+    /// The connection has not yet been established.
+    Connecting,
+    /// The WebSocket connection is established and communication is possible.
+    Open,
+    /// The connection is going through the closing handshake, or the close() method has been
+    /// invoked.
+    Closing,
+    /// The connection has been closed or could not be opened.
+    Closed,
+}
+
 impl WebSocket {
     /// Establish a WebSocket connection.
     pub fn open(url: &str) -> Result<Self, errors::WebSocketError> {
@@ -146,6 +163,28 @@ impl WebSocket {
             (None, Some(reason)) => self.ws.close_with_code_and_reason(1005, reason),
         };
         result.map_err(|e| WebSocketError::JsError(js_to_js_error(e)))
+    }
+
+    /// The current state of the websocket.
+    pub fn state(&self) -> State {
+        let ready_state = self.ws.ready_state();
+        match ready_state {
+            0 => State::Connecting,
+            1 => State::Open,
+            2 => State::Closing,
+            3 => State::Closed,
+            _ => unreachable!(),
+        }
+    }
+
+    /// The extensions in use.
+    pub fn extensions(&self) -> String {
+        self.ws.extensions()
+    }
+
+    /// The sub-protocol in use.
+    pub fn protocol(&self) -> String {
+        self.ws.protocol()
     }
 }
 
