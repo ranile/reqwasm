@@ -31,6 +31,7 @@
 use crate::js_to_js_error;
 use crate::websocket::errors::WebSocketError;
 use async_broadcast::Receiver;
+use events::{CloseEvent, ErrorEvent};
 use futures::ready;
 use futures::{Sink, Stream};
 use pin_project::{pin_project, pinned_drop};
@@ -40,7 +41,7 @@ use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
-use web_sys::{ErrorEvent, MessageEvent};
+use web_sys::MessageEvent;
 
 /// Wrapper around browser's WebSocket API.
 #[allow(missing_debug_implementations)]
@@ -115,28 +116,39 @@ impl WebSocket {
         ws.set_onmessage(Some(message_callback.as_ref().unchecked_ref()));
         message_callback.forget();
 
-        let error_callback: Closure<dyn FnMut(ErrorEvent)> = {
+        let error_callback: Closure<dyn FnMut(web_sys::ErrorEvent)> = {
             let sender = sender.clone();
-            Closure::wrap(Box::new(move |e: ErrorEvent| {
+            Closure::wrap(Box::new(move |e: web_sys::ErrorEvent| {
                 let sender = sender.clone();
                 wasm_bindgen_futures::spawn_local(async move {
                     let _ = sender
-                        .broadcast(StreamMessage::ConnectionError(parse_error(e)))
+                        .broadcast(StreamMessage::ErrorEvent(ErrorEvent {
+                            message: e.message(),
+                        }))
                         .await;
                 })
-            }) as Box<dyn FnMut(ErrorEvent)>)
+            }) as Box<dyn FnMut(web_sys::ErrorEvent)>)
         };
 
         ws.set_onerror(Some(error_callback.as_ref().unchecked_ref()));
         error_callback.forget();
 
-        let close_callback: Closure<dyn FnMut()> = {
-            Closure::wrap(Box::new(move || {
+        let close_callback: Closure<dyn FnMut(web_sys::CloseEvent)> = {
+            Closure::wrap(Box::new(move |e: web_sys::CloseEvent| {
                 let sender = sender.clone();
                 wasm_bindgen_futures::spawn_local(async move {
+                    let close_event = CloseEvent {
+                        code: e.code(),
+                        reason: e.reason(),
+                        was_clean: e.was_clean(),
+                    };
+
+                    let _ = sender
+                        .broadcast(StreamMessage::CloseEvent(close_event))
+                        .await;
                     let _ = sender.broadcast(StreamMessage::ConnectionClose).await;
                 })
-            }) as Box<dyn FnMut()>)
+            }) as Box<dyn FnMut(web_sys::CloseEvent)>)
         };
 
         ws.set_onerror(Some(close_callback.as_ref().unchecked_ref()));
@@ -153,6 +165,9 @@ impl WebSocket {
     ///
     /// See the [MDN Documentation](https://developer.mozilla.org/en-US/docs/Web/API/WebSocket/close#parameters)
     /// to learn about parameters passed to this function and when it can return an `Err(_)`
+    ///
+    /// **Note**: If *only one* of the instances of websocket is closed, the entire connection closes.
+    /// This is unlikely to happen in real-world as [`wasm_bindgen_futures::spawn_local`] requires `'static`.
     pub fn close(self, code: Option<u16>, reason: Option<&str>) -> Result<(), WebSocketError> {
         let result = match (code, reason) {
             (None, None) => self.ws.close(),
@@ -190,7 +205,8 @@ impl WebSocket {
 
 #[derive(Clone)]
 enum StreamMessage {
-    ConnectionError(errors::ConnectionError),
+    ErrorEvent(ErrorEvent),
+    CloseEvent(CloseEvent),
     Message(Message),
     ConnectionClose,
 }
@@ -203,12 +219,6 @@ fn parse_message(event: MessageEvent) -> Message {
         Message::Text(String::from(&txt))
     } else {
         unreachable!("message event, received Unknown: {:?}", event.data());
-    }
-}
-
-fn parse_error(event: ErrorEvent) -> errors::ConnectionError {
-    errors::ConnectionError {
-        message: event.message(),
     }
 }
 
@@ -252,8 +262,11 @@ impl Stream for WebSocket {
         let msg = ready!(self.project().message_receiver.poll_next(cx));
         match msg {
             Some(StreamMessage::Message(msg)) => Poll::Ready(Some(Ok(msg))),
-            Some(StreamMessage::ConnectionError(err)) => {
+            Some(StreamMessage::ErrorEvent(err)) => {
                 Poll::Ready(Some(Err(errors::WebSocketError::ConnectionError(err))))
+            }
+            Some(StreamMessage::CloseEvent(e)) => {
+                Poll::Ready(Some(Err(errors::WebSocketError::ConnectionClose(e))))
             }
             Some(StreamMessage::ConnectionClose) => Poll::Ready(None),
             None => Poll::Ready(None),
@@ -268,29 +281,52 @@ impl PinnedDrop for WebSocket {
     }
 }
 
-pub mod errors {
-    //! The errors
+pub mod events {
+    //! WebSocket Events
+    use std::fmt;
 
-    /// This is created from [`ErrorEvent`] received from `onerror` listener of the WebSocket.
-    #[derive(Clone, Debug, thiserror::Error)]
-    #[error("{message}")]
-    pub struct ConnectionError {
+    /// This is created from [`ErrorEvent`][web_sys::ErrorEvent] received from `onerror` listener of the WebSocket.
+    #[derive(Clone, Debug)]
+    pub struct ErrorEvent {
         /// The error message.
-        pub(super) message: String,
+        pub message: String,
     }
 
+    impl fmt::Display for ErrorEvent {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "{}", self.message)
+        }
+    }
+
+    /// Data emiited by `onclose` event
+    #[derive(Clone, Debug)]
+    pub struct CloseEvent {
+        /// Close code
+        pub code: u16,
+        /// Close reason
+        pub reason: String,
+        /// If the websockt was closed cleanly
+        pub was_clean: bool,
+    }
+}
+
+pub mod errors {
+    //! The errors
+    use super::events::*;
+
     /// Error returned by `WebSocket`
-    #[derive(Clone, Debug, thiserror::Error)]
+    #[derive(Clone, Debug)]
     pub enum WebSocketError {
-        /// Error from `onerror`
-        #[error("{0}")]
-        ConnectionError(
-            #[source]
-            #[from]
-            ConnectionError,
-        ),
-        /// Error while sending message
-        #[error("{0}")]
+        /// Data from `onerror`
+        ConnectionError(ErrorEvent),
+        /// Data from `onclose`
+        ConnectionClose(CloseEvent),
+        /// Any other error.
+        ///
+        /// This is variant is returned if
+        /// - Connection fails
+        /// - Sending message fails
+        /// - Closing WebSocket fails
         JsError(crate::JsError),
     }
 }

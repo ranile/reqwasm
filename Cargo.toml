@@ -45,6 +45,7 @@ features = [
     'Blob',
     'FormData',
     'FileReader',
+    'CloseEvent',
 
     'WebSocket',
     'ErrorEvent',
