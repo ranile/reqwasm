@@ -1,11 +1,12 @@
-//! Wrapper around `WebSocket` API
+//! The wrapper around `WebSocket` API using the Futures API to be used in async rust
 //!
 //! # Example
 //!
 //! ```rust
-//! # use reqwasm::websocket::*;
-//! # use wasm_bindgen_futures::spawn_local;
-//! # use futures::{SinkExt, StreamExt};
+//! use reqwasm::websocket::{Message, futures::WebSocket};
+//! use wasm_bindgen_futures::spawn_local;
+//! use futures::{SinkExt, StreamExt};
+//!
 //! # macro_rules! console_log {
 //! #    ($($expr:expr),*) => {{}};
 //! # }
@@ -28,10 +29,12 @@
 //! })
 //! # }
 //! ```
-use crate::js_to_js_error;
-use crate::websocket::errors::WebSocketError;
+use crate::websocket::{
+    events::{CloseEvent, ErrorEvent},
+    Message, State, WebSocketError,
+};
+use crate::{js_to_js_error, JsError};
 use async_broadcast::Receiver;
-use events::{CloseEvent, ErrorEvent};
 use futures::ready;
 use futures::{Sink, Stream};
 use pin_project::{pin_project, pinned_drop};
@@ -52,40 +55,28 @@ pub struct WebSocket {
     sink_wakers: Rc<RefCell<Vec<Waker>>>,
     #[pin]
     message_receiver: Receiver<StreamMessage>,
-}
-
-/// Message sent to and received from WebSocket.
-#[derive(Debug, PartialEq, Clone)]
-pub enum Message {
-    /// String message
-    Text(String),
-    /// ArrayBuffer parsed into bytes
-    Bytes(Vec<u8>),
-}
-
-/// The state of the websocket.
-///
-/// See [`WebSocket.readyState` on MDN](https://developer.mozilla.org/en-US/docs/Web/API/WebSocket/readyState)
-/// to learn more.
-#[derive(Copy, Clone, Debug)]
-pub enum State {
-    /// The connection has not yet been established.
-    Connecting,
-    /// The WebSocket connection is established and communication is possible.
-    Open,
-    /// The connection is going through the closing handshake, or the close() method has been
-    /// invoked.
-    Closing,
-    /// The connection has been closed or could not be opened.
-    Closed,
+    #[allow(clippy::type_complexity)]
+    closures: Rc<(
+        Closure<dyn FnMut()>,
+        Closure<dyn FnMut(MessageEvent)>,
+        Closure<dyn FnMut(web_sys::ErrorEvent)>,
+        Closure<dyn FnMut(web_sys::CloseEvent)>,
+    )>,
 }
 
 impl WebSocket {
     /// Establish a WebSocket connection.
-    pub fn open(url: &str) -> Result<Self, errors::WebSocketError> {
+    ///
+    /// This function may error in the following cases:
+    /// - The port to which the connection is being attempted is being blocked.
+    /// - The URL is invalid.
+    ///
+    /// The error returned is [`JsError`]. See the
+    /// [MDN Documentation](https://developer.mozilla.org/en-US/docs/Web/API/WebSocket/WebSocket#exceptions_thrown)
+    /// to learn more.
+    pub fn open(url: &str) -> Result<Self, JsError> {
         let wakers: Rc<RefCell<Vec<Waker>>> = Rc::new(RefCell::new(vec![]));
-        let ws = web_sys::WebSocket::new(url)
-            .map_err(|e| errors::WebSocketError::JsError(js_to_js_error(e)))?;
+        let ws = web_sys::WebSocket::new(url).map_err(js_to_js_error)?;
 
         let (sender, receiver) = async_broadcast::broadcast(10);
 
@@ -99,8 +90,8 @@ impl WebSocket {
         };
 
         ws.set_onopen(Some(open_callback.as_ref().unchecked_ref()));
-        open_callback.forget();
-
+        // open_callback.forget();
+        //
         let message_callback: Closure<dyn FnMut(MessageEvent)> = {
             let sender = sender.clone();
             Closure::wrap(Box::new(move |e: MessageEvent| {
@@ -114,7 +105,7 @@ impl WebSocket {
         };
 
         ws.set_onmessage(Some(message_callback.as_ref().unchecked_ref()));
-        message_callback.forget();
+        // message_callback.forget();
 
         let error_callback: Closure<dyn FnMut(web_sys::ErrorEvent)> = {
             let sender = sender.clone();
@@ -131,7 +122,7 @@ impl WebSocket {
         };
 
         ws.set_onerror(Some(error_callback.as_ref().unchecked_ref()));
-        error_callback.forget();
+        // error_callback.forget();
 
         let close_callback: Closure<dyn FnMut(web_sys::CloseEvent)> = {
             Closure::wrap(Box::new(move |e: web_sys::CloseEvent| {
@@ -152,12 +143,18 @@ impl WebSocket {
         };
 
         ws.set_onerror(Some(close_callback.as_ref().unchecked_ref()));
-        close_callback.forget();
+        // close_callback.forget();
 
         Ok(Self {
             ws,
             sink_wakers: wakers,
             message_receiver: receiver,
+            closures: Rc::new((
+                open_callback,
+                message_callback,
+                error_callback,
+                close_callback,
+            )),
         })
     }
 
@@ -168,7 +165,7 @@ impl WebSocket {
     ///
     /// **Note**: If *only one* of the instances of websocket is closed, the entire connection closes.
     /// This is unlikely to happen in real-world as [`wasm_bindgen_futures::spawn_local`] requires `'static`.
-    pub fn close(self, code: Option<u16>, reason: Option<&str>) -> Result<(), WebSocketError> {
+    pub fn close(self, code: Option<u16>, reason: Option<&str>) -> Result<(), JsError> {
         let result = match (code, reason) {
             (None, None) => self.ws.close(),
             (Some(code), None) => self.ws.close_with_code(code),
@@ -177,7 +174,7 @@ impl WebSocket {
             // see: https://developer.mozilla.org/en-US/docs/Web/API/WebSocket/close#parameters
             (None, Some(reason)) => self.ws.close_with_code_and_reason(1005, reason),
         };
-        result.map_err(|e| WebSocketError::JsError(js_to_js_error(e)))
+        result.map_err(js_to_js_error)
     }
 
     /// The current state of the websocket.
@@ -223,7 +220,7 @@ fn parse_message(event: MessageEvent) -> Message {
 }
 
 impl Sink<Message> for WebSocket {
-    type Error = errors::WebSocketError;
+    type Error = WebSocketError;
 
     fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         let ready_state = self.ws.ready_state();
@@ -242,7 +239,7 @@ impl Sink<Message> for WebSocket {
         };
         match result {
             Ok(_) => Ok(()),
-            Err(e) => Err(errors::WebSocketError::JsError(js_to_js_error(e))),
+            Err(e) => Err(WebSocketError::MessageSendError(js_to_js_error(e))),
         }
     }
 
@@ -256,17 +253,17 @@ impl Sink<Message> for WebSocket {
 }
 
 impl Stream for WebSocket {
-    type Item = Result<Message, errors::WebSocketError>;
+    type Item = Result<Message, WebSocketError>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let msg = ready!(self.project().message_receiver.poll_next(cx));
         match msg {
             Some(StreamMessage::Message(msg)) => Poll::Ready(Some(Ok(msg))),
             Some(StreamMessage::ErrorEvent(err)) => {
-                Poll::Ready(Some(Err(errors::WebSocketError::ConnectionError(err))))
+                Poll::Ready(Some(Err(WebSocketError::ConnectionError(err))))
             }
             Some(StreamMessage::CloseEvent(e)) => {
-                Poll::Ready(Some(Err(errors::WebSocketError::ConnectionClose(e))))
+                Poll::Ready(Some(Err(WebSocketError::ConnectionClose(e))))
             }
             Some(StreamMessage::ConnectionClose) => Poll::Ready(None),
             None => Poll::Ready(None),
@@ -281,52 +278,28 @@ impl PinnedDrop for WebSocket {
     }
 }
 
-pub mod events {
-    //! WebSocket Events
-    use std::fmt;
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::{SinkExt, StreamExt};
+    use wasm_bindgen_test::*;
 
-    /// This is created from [`ErrorEvent`][web_sys::ErrorEvent] received from `onerror` listener of the WebSocket.
-    #[derive(Clone, Debug)]
-    pub struct ErrorEvent {
-        /// The error message.
-        pub message: String,
-    }
+    wasm_bindgen_test_configure!(run_in_browser);
 
-    impl fmt::Display for ErrorEvent {
-        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            write!(f, "{}", self.message)
-        }
-    }
+    const ECHO_SERVER_URL: &str = env!("ECHO_SERVER_URL");
 
-    /// Data emiited by `onclose` event
-    #[derive(Clone, Debug)]
-    pub struct CloseEvent {
-        /// Close code
-        pub code: u16,
-        /// Close reason
-        pub reason: String,
-        /// If the websockt was closed cleanly
-        pub was_clean: bool,
-    }
-}
+    #[wasm_bindgen_test]
+    async fn websocket_works() {
+        let mut ws = WebSocket::open(ECHO_SERVER_URL).unwrap();
 
-pub mod errors {
-    //! The errors
-    use super::events::*;
+        ws.send(Message::Text("test".to_string())).await.unwrap();
 
-    /// Error returned by `WebSocket`
-    #[derive(Clone, Debug)]
-    pub enum WebSocketError {
-        /// Data from `onerror`
-        ConnectionError(ErrorEvent),
-        /// Data from `onclose`
-        ConnectionClose(CloseEvent),
-        /// Any other error.
-        ///
-        /// This is variant is returned if
-        /// - Connection fails
-        /// - Sending message fails
-        /// - Closing WebSocket fails
-        JsError(crate::JsError),
+        // ignore first message
+        // the echo-server used sends it's info in the first message
+        let _ = ws.next().await;
+        assert_eq!(
+            ws.next().await.unwrap().unwrap(),
+            Message::Text("test".to_string())
+        )
     }
 }
