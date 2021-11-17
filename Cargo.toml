@@ -13,11 +13,24 @@ exclude = [
     ".idea",
 ]
 
+[package.metadata.docs.rs]
+all-features = true
+
 [features]
-default = ["json"]
+default = ["json", "websocket"]
 
 # Enables `.json()` on `Response`
 json = ["wasm-bindgen/serde-serialize", "serde", "serde_json"]
+# Enables the WebSocket API
+websocket = [
+    'web-sys/WebSocket',
+    'web-sys/ErrorEvent',
+    'web-sys/FileReader',
+    'web-sys/MessageEvent',
+    'web-sys/ProgressEvent',
+    'web-sys/CloseEvent',
+    'web-sys/BinaryType',
+]
 
 [dependencies]
 wasm-bindgen = { version = "0.2", features = ["serde-serialize"] }
@@ -51,15 +64,6 @@ features = [
     'ReadableStream',
     'Blob',
     'FormData',
-    'FileReader',
-    'CloseEvent',
-
-    'WebSocket',
-    'ErrorEvent',
-    'FileReader',
-    'MessageEvent',
-    'ProgressEvent',
-    'BinaryType',
 ]
 
 [dev-dependencies]
