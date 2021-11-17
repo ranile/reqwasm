@@ -13,15 +13,22 @@ exclude = [
     ".idea",
 ]
 
+[features]
+default = ["json"]
+
+# Enables `.json()` on `Response`
+json = ["wasm-bindgen/serde-serialize", "serde", "serde_json"]
+
 [dependencies]
 wasm-bindgen = { version = "0.2", features = ["serde-serialize"] }
 js-sys = "0.3"
 wasm-bindgen-futures = "0.4"
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
 thiserror = "1.0"
 futures = "0.3.14"
 gloo-utils = "0.1.0"
+
+serde = { version = "1.0", features = ["derive"], optional = true }
+serde_json = { version = "1.0", optional = true }
 
 async-broadcast = "0.3"
 pin-project = "1"

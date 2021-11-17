@@ -9,6 +9,7 @@ pub enum Error {
     #[error("{0}")]
     JsError(JsError),
     /// Error returned by `serde` during deserialization.
+    #[cfg(feature = "json")]
     #[error("{0}")]
     SerdeError(
         #[source]
