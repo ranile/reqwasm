@@ -32,6 +32,8 @@ websocket = [
     'web-sys/BinaryType',
     "async-broadcast",
     "pin-project",
+    "futures-core",
+    "futures-sink",
 ]
 # Enables the HTTP API
 http = [
@@ -59,7 +61,8 @@ js-sys = "0.3"
 gloo-utils = "0.1.0"
 
 wasm-bindgen-futures = "0.4"
-futures = "0.3.14"
+futures-core = { version = "0.3", optional = true }
+futures-sink = { version = "0.3", optional = true }
 
 thiserror = "1.0"
 

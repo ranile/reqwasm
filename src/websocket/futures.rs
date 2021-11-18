@@ -35,8 +35,8 @@ use crate::websocket::{
     Message, State, WebSocketError,
 };
 use async_broadcast::Receiver;
-use futures::ready;
-use futures::{Sink, Stream};
+use futures_core::{ready, Stream};
+use futures_sink::Sink;
 use gloo_utils::errors::JsError;
 use pin_project::{pin_project, pinned_drop};
 use std::cell::RefCell;
