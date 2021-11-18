@@ -30,6 +30,7 @@ websocket = [
     'web-sys/ProgressEvent',
     'web-sys/CloseEvent',
     'web-sys/BinaryType',
+    'web-sys/Blob',
     "async-broadcast",
     "pin-project",
     "futures-core",
