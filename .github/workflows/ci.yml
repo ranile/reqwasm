@@ -86,6 +86,12 @@ jobs:
         with:
           command: clippy
           args: --no-default-features --features websocket --target wasm32-unknown-unknown -- -D warnings
+      
+      - name: Run clippy (with http feature)
+        uses: actions-rs/cargo@v1
+        with:
+          command: clippy
+          args: --no-default-features --features http --target wasm32-unknown-unknown -- -D warnings
 
   test:
     name: Test
